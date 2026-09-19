@@ -1,0 +1,78 @@
+import * as Context from "effect/Context";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
+
+import * as Electron from "electron";
+
+const electronSafeStorageErrorFields = {
+  cause: Schema.Defect(),
+};
+
+export class ElectronSafeStorageAvailabilityError extends Schema.TaggedError<ElectronSafeStorageAvailabilityError>()(
+  "ElectronSafeStorageAvailabilityError",
+  {
+    ...electronSafeStorageErrorFields,
+  },
+) {
+  override get message(): string {
+    return "Electron safe storage failed to check encryption availability.";
+  }
+}
+
+export class ElectronSafeStorageEncryptError extends Schema.TaggedError<ElectronSafeStorageEncryptError>()(
+  "ElectronSafeStorageEncryptError",
+  {
+    ...electronSafeStorageErrorFields,
+  },
+) {
+  override get message(): string {
+    return "Electron safe storage failed to encrypt a string.";
+  }
+}
+
+export class ElectronSafeStorageDecryptError extends Schema.TaggedError<ElectronSafeStorageDecryptError>()(
+  "ElectronSafeStorageDecryptError",
+  {
+    ...electronSafeStorageErrorFields,
+  },
+) {
+  override get message(): string {
+    return "Electron safe storage failed to decrypt a string.";
+  }
+}
+
+export class ElectronSafeStorage extends Context.Service<
+  ElectronSafeStorage,
+  {
+    readonly isEncryptionAvailable: Effect.Effect<boolean, ElectronSafeStorageAvailabilityError>;
+    readonly encryptString: (
+      value: string,
+    ) => Effect.Effect<Uint8Array, ElectronSafeStorageEncryptError>;
+    readonly decryptString: (
+      value: Uint8Array,
+    ) => Effect.Effect<string, ElectronSafeStorageDecryptError>;
+  }
+>()("@t3tools/desktop/electron/ElectronSafeStorage") {}
+
+/** @public Service construction is part of the canonical Effect module API. */
+export const make = Effect.succeed(
+  ElectronSafeStorage.of({
+    isEncryptionAvailable: Effect.try({
+      try: () => Electron.safeStorage.isEncryptionAvailable(),
+      catch: (cause) => new ElectronSafeStorageAvailabilityError({ cause }),
+    }),
+    encryptString: (value) =>
+      Effect.try({
+        try: () => Electron.safeStorage.encryptString(value),
+        catch: (cause) => new ElectronSafeStorageEncryptError({ cause }),
+      }),
+    decryptString: (value) =>
+      Effect.try({
+        try: () => Electron.safeStorage.decryptString(Buffer.from(value)),
+        catch: (cause) => new ElectronSafeStorageDecryptError({ cause }),
+      }),
+  }),
+);
+
+export const layer = Layer.effect(ElectronSafeStorage, make);

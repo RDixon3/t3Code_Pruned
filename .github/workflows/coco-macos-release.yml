@@ -1,0 +1,287 @@
+name: CoCo Desktop Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: CoCo version (for example 0.1.0)
+        required: true
+        type: string
+      publish:
+        description: Publish installers after verification (disable for a build rehearsal)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coco-desktop-release
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Build ad-hoc signed Apple Silicon installer
+    needs: verify
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      VERSION: ${{ inputs.version }}
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      T3CODE_DESKTOP_SIGNED: "false"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Validate version and architecture
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+          [[ "$(uname -m)" == "arm64" ]] || exit 1
+      - uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+      - name: Install dependencies
+        run: vp install --frozen-lockfile --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts... --filter=@t3tools/oxlint-plugin-t3code...
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          targets: aarch64-apple-darwin
+      - name: Prepare CoCo release
+        run: |
+          node scripts/update-release-package-versions.ts "$VERSION"
+      - name: Build installer
+        id: package
+        run: vp run dist:desktop:artifact --platform mac --target dmg --arch arm64 --build-version "$VERSION" --keep-stage --verbose
+      - name: Audit staged production dependencies
+        env:
+          STAGE_PATH: ${{ steps.package.outputs.stage_path }}
+        run: |
+          set -euo pipefail
+          cd "$STAGE_PATH/app"
+          vp pm audit --production
+      - name: Inventory packaged dependencies
+        uses: anchore/sbom-action@57aae528053a48a3f6235f2d9461b05fbcb7366d # v0.23.1
+        with:
+          path: ${{ steps.package.outputs.stage_path }}
+          syft-version: v1.52.0
+          format: cyclonedx-json
+          output-file: coco-macos-arm64.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Verify and checksum release
+        run: |
+          set -euo pipefail
+          test -f "release/CoCo-${VERSION}-arm64.dmg"
+          mkdir -p release-files
+          cp "release/CoCo-${VERSION}-arm64.dmg" release-files/
+          cp coco-macos-arm64.cdx.json release-files/
+          hdiutil verify "release-files/CoCo-${VERSION}-arm64.dmg"
+          mountpoint="$RUNNER_TEMP/coco-mounted"
+          hdiutil attach "release-files/CoCo-${VERSION}-arm64.dmg" -nobrowse -readonly -mountpoint "$mountpoint"
+          trap 'hdiutil detach "$mountpoint"' EXIT
+          app="$mountpoint/CoCo.app"
+          test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$app/Contents/Info.plist")" = "io.github.rdixon3.coco"
+          test "$(lipo -archs "$app/Contents/MacOS/CoCo")" = "arm64"
+          test ! -f "$app/Contents/Resources/app-update.yml"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign --display --verbose=2 "$app" 2>&1 | grep -Fx 'Signature=adhoc'
+          cd release-files
+          shasum -a 256 *.dmg *.cdx.json > macos-sha256.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coco-macos-arm64
+          path: release-files/
+          if-no-files-found: error
+          retention-days: 14
+
+  # The Windows app retains T3's WSL backend; this is a native module, not a Linux app release.
+  wsl_prebuild:
+    name: Build Windows WSL terminal module
+    needs: verify
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+      - name: Build Linux node-pty
+        run: |
+          set -euo pipefail
+          vp install --frozen-lockfile --filter=t3... --filter=@t3tools/scripts...
+          pty_pkg="$(node -e "console.log(require.resolve('node-pty/package.json', { paths: ['./apps/server'] }))")"
+          pty_dir="$(dirname "$pty_pkg")"
+          node scripts/node_modules/node-gyp/bin/node-gyp.js rebuild --directory "$pty_dir"
+          mkdir -p wsl-prebuild
+          cp "$pty_dir/build/Release/pty.node" wsl-prebuild/pty.node
+          file wsl-prebuild/pty.node | grep 'ELF 64-bit.*x86-64'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wsl-node-pty-x64
+          path: wsl-prebuild/pty.node
+          if-no-files-found: error
+          retention-days: 14
+
+  windows:
+    name: Build unsigned Windows x64 installer
+    needs: wsl_prebuild
+    runs-on: windows-2025
+    timeout-minutes: 90
+    env:
+      VERSION: ${{ inputs.version }}
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      T3CODE_DESKTOP_SIGNED: "false"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Validate version and architecture
+        shell: pwsh
+        run: |
+          if ($env:VERSION -notmatch '^\d+\.\d+\.\d+$') { throw "Invalid release version" }
+          if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw "Expected an x64 runner" }
+      - uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          cache: false
+          run-install: false
+      - name: Install dependencies
+        run: vp install --frozen-lockfile --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts... --filter=@t3tools/oxlint-plugin-t3code...
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Install Spectre-mitigated MSVC libraries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
+          $installPath = & "$installer\vswhere.exe" -products * -latest -property installationPath
+          if (-not $installPath) { throw 'Visual Studio was not found' }
+          $process = Start-Process -FilePath "$installer\setup.exe" -WindowStyle Hidden -Wait -PassThru -ArgumentList @(
+            'modify', '--installPath', "`"$installPath`"", '--add',
+            'Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre', '--quiet', '--norestart'
+          )
+          if ($process.ExitCode -notin @(0, 3010)) { throw "Visual Studio Installer failed: $($process.ExitCode)" }
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: wsl-node-pty-x64
+          path: wsl-prebuild
+      - name: Prepare CoCo release
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/update-release-package-versions.ts "$VERSION"
+      - name: Build installer
+        id: package
+        shell: bash
+        run: vp run dist:desktop:artifact --platform win --target nsis --arch x64 --build-version "$VERSION" --wsl-prebuild "$GITHUB_WORKSPACE/wsl-prebuild/pty.node" --keep-stage --verbose
+      - name: Audit staged production dependencies
+        shell: bash
+        env:
+          STAGE_PATH: ${{ steps.package.outputs.stage_path }}
+        run: |
+          set -euo pipefail
+          cd "$STAGE_PATH/app"
+          vp pm audit --production
+          cd "$STAGE_PATH/server"
+          vp pm audit --production
+      - name: Inventory packaged dependencies
+        uses: anchore/sbom-action@57aae528053a48a3f6235f2d9461b05fbcb7366d # v0.23.1
+        with:
+          path: ${{ steps.package.outputs.stage_path }}
+          syft-version: v1.52.0
+          format: cyclonedx-json
+          output-file: coco-windows-x64.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Verify installation and checksum release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $file = "CoCo-$env:VERSION-x64.exe"
+          $installer = (Resolve-Path "release/$file").Path
+          $installDir = Join-Path $env:LOCALAPPDATA 'Programs/coco'
+          $process = Start-Process -FilePath $installer -ArgumentList '/S' -WindowStyle Hidden -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "CoCo installation failed: $($process.ExitCode)" }
+          $app = Get-Item (Join-Path $installDir 'CoCo.exe')
+          if ($app.VersionInfo.ProductName -ne 'CoCo') { throw 'Incorrect product branding' }
+          $version = "$($app.VersionInfo.ProductMajorPart).$($app.VersionInfo.ProductMinorPart).$($app.VersionInfo.ProductBuildPart)"
+          if ($version -ne $env:VERSION) { throw 'Incorrect application version' }
+          if (Test-Path (Join-Path $installDir 'resources/app-update.yml')) { throw 'Automatic app updates must remain disabled' }
+          $reader = [System.IO.BinaryReader]::new([System.IO.File]::OpenRead($app.FullName))
+          try {
+            $reader.BaseStream.Position = 0x3c
+            $reader.BaseStream.Position = $reader.ReadInt32()
+            if ($reader.ReadUInt32() -ne 0x00004550 -or $reader.ReadUInt16() -ne 0x8664) { throw 'Expected an x64 application' }
+          } finally { $reader.Dispose() }
+          if ((Get-AuthenticodeSignature $installer).Status -ne 'NotSigned') { throw 'Expected an unsigned installer' }
+          New-Item -ItemType Directory -Path release-files -Force | Out-Null
+          Copy-Item -LiteralPath $installer -Destination "release-files/$file"
+          Copy-Item -LiteralPath 'coco-windows-x64.cdx.json' -Destination 'release-files/'
+          $hash = (Get-FileHash "release-files/$file" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $file" | Set-Content 'release-files/windows-sha256.txt' -Encoding utf8NoBOM
+          $sbomHash = (Get-FileHash 'release-files/coco-windows-x64.cdx.json' -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$sbomHash  coco-windows-x64.cdx.json" | Add-Content 'release-files/windows-sha256.txt' -Encoding utf8NoBOM
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coco-windows-x64
+          path: release-files/
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    if: inputs.publish && github.ref_name == github.event.repository.default_branch
+    environment: release
+    name: Publish CoCo GitHub Release
+    needs: [build, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ inputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: coco-*
+          merge-multiple: true
+          path: release-files
+      - name: Publish release
+        run: |
+          set -euo pipefail
+          cd release-files
+          test -f "CoCo-${VERSION}-arm64.dmg"
+          test -f "CoCo-${VERSION}-x64.exe"
+          cat macos-sha256.txt windows-sha256.txt > SHA256SUMS.txt
+          sha256sum --check SHA256SUMS.txt
+          cat > release-notes.md <<'NOTES'
+          CoCo pilot for macOS Apple Silicon (M-series Macs) and Windows x64.
+
+          - Mac: download the DMG, open it, and drag CoCo into Applications.
+          - Windows: download and run the x64 EXE installer.
+
+          The Mac build is ad-hoc signed and its app signature is verified during packaging; it is not Developer ID signed or notarized. The Windows installer is unsigned and may display an unknown-publisher warning. Use your organization's approved installation process.
+
+          - Local-only desktop operation; remote connection services are not included.
+          - CoCo branding and light/dark theme included.
+          - Separate local data in ~/.coco; stock T3 data is not migrated.
+          - Manual upgrades: download and install the next CoCo release. Automatic application updates are disabled.
+          - Jira, v0, and ServiceNow sign-in settings are included. ServiceNow requires your instance's OAuth app registration; pursuit table integration is not configured.
+          - Install and authenticate your chosen coding-provider CLI separately.
+          - CycloneDX inventories cover detected packages in the staged app payloads. Bundled source and external provider CLIs require separate dependency review.
+          - SHA256SUMS.txt contains installer and inventory checksums.
+          NOTES
+          gh release create "coco-v${VERSION}" "CoCo-${VERSION}-arm64.dmg" "CoCo-${VERSION}-x64.exe" coco-macos-arm64.cdx.json coco-windows-x64.cdx.json SHA256SUMS.txt \
+            --target "$RELEASE_COMMIT" --title "CoCo ${VERSION} - Apple Silicon and Windows" \
+            --notes-file release-notes.md --draft
+          gh release edit "coco-v${VERSION}" --draft=false --latest

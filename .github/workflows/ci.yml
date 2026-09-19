@@ -1,0 +1,64 @@
+name: CoCo CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coco-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check and build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, windows-2025]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          cache: false
+          run-install: false
+      - name: Install locked dependencies
+        run: vp install --frozen-lockfile
+      - name: Static checks
+        run: vp check
+      - name: Typecheck
+        run: vp run typecheck
+      - name: Tests
+        run: vp run test
+      - name: Build desktop pipeline
+        run: vp run build:desktop
+      - name: Verify sandboxed preload output
+        run: node apps/desktop/scripts/verify-preload-bundle.mjs
+      - name: Desktop startup smoke test
+        run: vp run test:desktop-smoke
+      - name: Preview isolation and local network regression
+        run: node apps/desktop/scripts/preview-security-test.mjs
+
+  native:
+    name: Native resource monitor
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --manifest-path native/resource-monitor/Cargo.toml -- --check
+      - run: cargo test --locked --manifest-path native/resource-monitor/Cargo.toml

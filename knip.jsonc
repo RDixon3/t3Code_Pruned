@@ -1,0 +1,61 @@
+{
+  "$schema": "https://unpkg.com/knip@6/schema.json",
+  // Effect-tsgo reads this legacy plugin name as configuration; it is not a separate package.
+  "ignoreDependencies": ["@effect/language-service"],
+  // These executables are supplied by the OS or installed separately from npm.
+  "ignoreBinaries": ["file", "mkfifo", "pkill", "pkg-config", "plutil", "sips"],
+  "workspaces": {
+    ".": {
+      "project": ["*.{js,mjs,cjs,ts,mts,cts}"],
+    },
+    "scripts": {
+      // The WSL release job invokes this executable by path.
+      "ignoreDependencies": ["node-gyp"],
+    },
+    "apps/server": {
+      // Vite+ pack and local backend entry points.
+      "entry": ["src/bin.ts!", "scripts/cli.ts", "src/provider/testFixtures/*.mjs"],
+      // Native msgpack acceleration and the Vite+ web build prerequisite.
+      "ignoreDependencies": ["msgpackr-extract", "@t3tools/web"],
+    },
+    "apps/desktop": {
+      // Electron loads these bundles by filename rather than importing them.
+      "entry": [
+        "src/electron/WindowsForegroundFocusWorker.ts!",
+        "src/snapShot/GlobalShiftShortcutWorker.ts!",
+        "src/snapShot/RegionSnapShotWorker.ts!",
+        "src/snapShot/SnapShotAccessibilityWorker.ts!",
+        "src/main.ts!",
+        "src/preload.ts!",
+        "src/preview-pick-preload.ts!",
+        "src/preview-element-context.ts!",
+        "src/preview-pip-preload.ts!",
+        "src/preview/Annotation.css!",
+        "scripts/fixtures/preview-security-main.ts",
+      ],
+      // The injected runtime resolves Playwright by string; release tooling runs
+      // electron-builder from this workspace, outside its package scripts.
+      "ignoreDependencies": ["playwright-core", "electron-builder"],
+    },
+    "apps/web": {
+      // Worktree setup invokes this directly from t3.json.
+      "entry": ["scripts/warm-dep-cache.ts"],
+    },
+    "packages/*": {
+      // These workspace packages are private to this monorepo.
+      "includeEntryExports": true,
+    },
+    "packages/effect-acp": {
+      "includeEntryExports": true,
+      "entry": ["test/fixtures/*.ts"],
+      // Generated declarations are retained by dependency closure from actual operations.
+      "ignoreIssues": { "src/_generated/schema.gen.ts": ["exports", "types"] },
+    },
+    "packages/effect-codex-app-server": {
+      "includeEntryExports": true,
+      "entry": ["test/fixtures/*.ts"],
+      // Generated declarations are retained by dependency closure from actual operations.
+      "ignoreIssues": { "src/_generated/schema.gen.ts": ["exports", "types"] },
+    },
+  },
+}
